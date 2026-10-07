@@ -1,4 +1,4 @@
-#define VERSION 0
+#define VERSION 1
 
 #if VERSION == 0
 
@@ -237,9 +237,16 @@ void loop(){}
 #endif
 
 #if VERSION == 1
-
+// Version 1: prototipos y definiciones en cabecera
+#include <Arduino.h>
 #include "servo_control.hpp"
 
+void setup() {
+    Serial.begin(115200);
 
+    initServos();
+}
+
+void loop() {}
 
 #endif
