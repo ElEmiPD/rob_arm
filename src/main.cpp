@@ -1,4 +1,4 @@
-#define VERSION 1
+#define VERSION 2
 
 #if VERSION == 0
 
@@ -251,8 +251,6 @@ void loop() {}
 
 #endif
 
-#define VERSION 2
-
 #if VERSION == 2
 // Version 2: control de servos por puerto serial (semaforo + tareas FreeRTOS)
 #include <Arduino.h>
@@ -261,7 +259,7 @@ void loop() {}
 void setup() {
     Serial.begin(115200);
 
-    initServos();   // Crea el semáforo, las 6 tareas de servo y la tarea serial
+    initServos(); 
 }
 
 void loop() {}
