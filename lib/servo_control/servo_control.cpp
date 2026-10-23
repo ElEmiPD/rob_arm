@@ -42,9 +42,11 @@ static const ServoConfig servoCfg[NUM_SERVOS] = {
 
 static const int POS_INICIAL = 90;
 
-// Posición a la que debe llegar cada servo.
-// La escribe TaskSerial y la lee la tarea de cada servo
-// (enteros de 32 bits: acceso atómico en ESP32).
+/*
+  Posición a la que debe llegar cada servo.
+  La escribe TaskSerial y la lee la tarea de cada servo
+  (enteros de 32 bits: acceso atómico en ESP32).
+*/
 static volatile int targetPos[NUM_SERVOS];
 
 // Avanza 1 grado hacia el objetivo (solo escribe si hay cambio)
@@ -124,6 +126,7 @@ void TaskSerial(void *pvParameters) {
                 }
             } else if (len < sizeof(buf) - 1) {
                 buf[len++] = c;
+                Serial.write(c);  // echo
             }
         }
         vTaskDelay(pdMS_TO_TICKS(10));
