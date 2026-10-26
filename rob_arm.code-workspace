@@ -6,6 +6,10 @@
 		{
 			"name": "prueba_xiao_cam",
 			"path": "../prueba_xiao_cam"
+		},
+		{
+			"name": "prueba_wifi",
+			"path": "../prueba_wifi"
 		}
 	],
 	"settings": {}
