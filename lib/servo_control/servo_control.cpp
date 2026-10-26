@@ -16,9 +16,7 @@ TaskHandle_t taskServo5Handle = NULL;
 TaskHandle_t taskServo6Handle = NULL;
 
 #if VERSION == 2
-// ===============================================================
 // VERSION 2: control por puerto serial
-// ===============================================================
 
 /*
   Nombre del comando y rango de cada servo (indice 0 = servo 1).
@@ -135,9 +133,7 @@ void TaskSerial(void *pvParameters) {
 
 #endif // VERSION == 2
 
-// ===============================================================
 // Inicialización (común a ambas versiones)
-// ===============================================================
 void initServos() {
 #if VERSION == 2
     for (int i = 0; i < NUM_SERVOS; i++)
@@ -169,9 +165,7 @@ void initServos() {
 #endif
 }
 
-// ===============================================================
 // Tareas de los servos
-// ===============================================================
 #if VERSION == 2
 // ---- VERSION 2: cada servo va hacia su posición objetivo ----
 
