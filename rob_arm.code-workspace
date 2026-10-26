@@ -6,6 +6,13 @@
 		{
 			"name": "prueba_xiao_cam",
 			"path": "../prueba_xiao_cam"
+<<<<<<< HEAD
+=======
+		},
+		{
+			"name": "prueba_wifi",
+			"path": "../prueba_wifi"
+>>>>>>> comandos
 		}
 	],
 	"settings": {}
