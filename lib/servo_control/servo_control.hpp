@@ -8,6 +8,10 @@
 #include <Arduino.h>
 #include <ESP32Servo.h>
 
+// Comandos por wifi
+#include <WiFi.h>
+#include <PubSubClient.h>
+
 // Definición de pines
 typedef enum {
     pinSM1 = 19,    // Base
@@ -17,6 +21,9 @@ typedef enum {
     pinSM5 = 16,    // Giro
     pinSM6 = 14     // Pinza
 } Servos_t;
+
+
+
 
 // Función principal para inicializar los servos y lanzar las tareas de FreeRTOS
 void initServos();
@@ -32,6 +39,20 @@ void TaskServo6(void *pvParameters);
 #if VERSION == 2
 // Tarea que lee los comandos del puerto serial (ej. "base50", "codo60")
 void TaskSerial(void *pvParameters);
+
+//-----------------------------------------------------
+void wifi_init();
+
+void mqtt_init();
+
+void mqtt_callback(char* topic, byte* payload, unsigned int length);
+
+void TaskWIFI(void *pvParameters);
+void TaskMQTT(void *pvParameters);
+void mqttCallback(char* topic, byte* payload, unsigned int length);
+
+//-----------------------------------------------------
+
 
 #endif // VERSION == 2
 

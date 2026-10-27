@@ -1,5 +1,10 @@
 #include "servo_control.hpp"
 
+#if VERSION == 2
+#include <WiFi.h>
+#include <PubSubClient.h>
+#endif
+
 Servo servo1;
 Servo servo2;
 Servo servo3;
@@ -16,7 +21,13 @@ TaskHandle_t taskServo5Handle = NULL;
 TaskHandle_t taskServo6Handle = NULL;
 
 #if VERSION == 2
-// VERSION 2: control por puerto serial
+// VERSION 2: control por puerto serial y por MQTT
+
+// wifi y mqtt
+String stMac;
+
+WiFiClient espClient;
+PubSubClient client(espClient);
 
 /*
   Nombre del comando y rango de cada servo (indice 0 = servo 1).
@@ -40,9 +51,20 @@ static const ServoConfig servoCfg[NUM_SERVOS] = {
 
 static const int POS_INICIAL = 90;
 
+//-----------------------------------------------------
+// Wifi
+const char* ssid = "60824";
+const char* password = "74255668";
+
+// MQTT
+ const char* mqtt_server = "mqtt-dashboard.com";
+const int mqtt_port = 1883;
+const char* mqtt_topic = "stust/rob_arm/control";
+//-----------------------------------------------------
+
 /*
   Posición a la que debe llegar cada servo.
-  La escribe TaskSerial y la lee la tarea de cada servo
+  La escriben TaskSerial y mqttCallback, y la lee la tarea de cada servo
   (enteros de 32 bits: acceso atómico en ESP32).
 */
 static volatile int targetPos[NUM_SERVOS];
@@ -63,7 +85,7 @@ static inline void stepServo(Servo &servo, int idx, int &pos) {
 // Interpreta un comando como "base50" o "codo 60"
 static void processCommand(char *cmd) {
     // Pasar a minúsculas y quitar espacios
-    char clean[32];
+    char clean[100];
     size_t n = 0;
     for (char *p = cmd; *p && n < sizeof(clean) - 1; p++) {
         if (!isspace((unsigned char)*p))
@@ -109,7 +131,7 @@ static void processCommand(char *cmd) {
 
 // Tarea que acumula caracteres hasta recibir fin de línea
 void TaskSerial(void *pvParameters) {
-    char buf[32];
+    char buf[100];
     size_t len = 0;
 
     while (1) {
@@ -131,6 +153,136 @@ void TaskSerial(void *pvParameters) {
     }
 }
 
+// ---------------------------------------------------------------
+// wifi
+// ---------------------------------------------------------------
+void TaskWIFI(void *pvParameters)
+{
+    while (1) {
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.println("[WiFi] Conectando...");
+            WiFi.begin(ssid, password);
+
+            while (WiFi.status() != WL_CONNECTED) {
+                vTaskDelay(pdMS_TO_TICKS(500));
+            }
+
+            Serial.print("[WiFi] Conectado. IP: ");
+            Serial.println(WiFi.localIP());
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+void wifi_init() {
+    WiFi.mode(WIFI_STA);
+    stMac = WiFi.macAddress();
+
+    Serial.print("[WiFi] MAC: ");
+    Serial.println(stMac);
+
+    xTaskCreatePinnedToCore(TaskWIFI, "WiFi", 3072, NULL, 2, NULL, 0);
+}
+
+// ---------------------------------------------------------------
+// mqtt
+// ---------------------------------------------------------------
+
+// Cada mensaje recibido se interpreta como un comando (ej. "base50")
+void mqttCallback(char* topic, byte* payload, unsigned int length)
+{
+    char buf[100];
+
+    // Evitar desbordar el buffer si llega un mensaje largo
+    if (length >= sizeof(buf))
+        length = sizeof(buf) - 1;
+
+    Serial.print("[MQTT] Recibido en ");
+    Serial.print(topic);
+    Serial.print(": ");
+
+    for (unsigned int i = 0; i < length; i++) {
+        Serial.print((char)payload[i]);
+        buf[i] = (char)payload[i];
+    }
+    buf[length] = '\0';
+
+    Serial.println();
+
+    processCommand(buf);
+}
+
+void TaskMQTT(void *pvParameters)
+{
+    unsigned long lastAttempt = 0;
+    unsigned long lastPublish = 0;
+    uint32_t counter = 0;
+
+    String clientId = "ControlAcceso-" + stMac;
+
+    while (1) {
+        if (WiFi.status() == WL_CONNECTED) {
+
+            if (!client.connected()) {
+                if (millis() - lastAttempt >= 5000) {
+                    lastAttempt = millis();
+
+                    Serial.print("[MQTT] Conectando con ID: ");
+                    Serial.println(clientId);
+
+                    if (client.connect(clientId.c_str())) {
+                        Serial.println("[MQTT] Conectado");
+
+                        if (client.subscribe(mqtt_topic)) {
+                            Serial.print("[MQTT] Suscrito a: ");
+                            Serial.println(mqtt_topic);
+                        }
+                    } else {
+                        Serial.printf(
+                            "[MQTT] Error de conexion: %d\n",
+                            client.state()
+                        );
+                    }
+                }
+            } else {
+                client.loop();
+
+                if (millis() - lastPublish >= 60000) {
+                    lastPublish = millis();
+
+                    char mensaje[100];
+
+                    snprintf(
+                        mensaje, sizeof(mensaje),
+                        "Hola desde ESP32. Mensaje: %lu",
+                        (unsigned long)++counter
+                    );
+
+                    if (client.publish(mqtt_topic, mensaje)) {
+                        Serial.printf(
+                            "[MQTT] Publicado: %s\n", mensaje
+                        );
+                    } else {
+                        Serial.println("[MQTT] Error al publicar");
+                    }
+                }
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+void mqtt_init() {
+    client.setServer(mqtt_server, mqtt_port);
+    client.setCallback(mqttCallback);
+    client.setKeepAlive(15);
+    client.setSocketTimeout(3);
+
+    xTaskCreatePinnedToCore(TaskMQTT, "MQTT", 4096, NULL, 1, NULL, 1);
+}
+
 #endif // VERSION == 2
 
 // Inicialización (común a ambas versiones)
@@ -148,12 +300,12 @@ void initServos() {
     servo5.attach(pinSM5);
     servo6.attach(pinSM6);
 
-    xTaskCreate(TaskServo1, "TaskServo1", 3072, NULL, 1, NULL);
-    xTaskCreate(TaskServo2, "TaskServo2", 3072, NULL, 1, NULL);
-    xTaskCreate(TaskServo3, "TaskServo3", 3072, NULL, 1, NULL);
-    xTaskCreate(TaskServo4, "TaskServo4", 3072, NULL, 1, NULL);
-    xTaskCreate(TaskServo5, "TaskServo5", 3072, NULL, 1, NULL);
-    xTaskCreate(TaskServo6, "TaskServo6", 3072, NULL, 1, NULL);
+    xTaskCreate(TaskServo1, "TaskServo1", 2048, NULL, 1, NULL);
+    xTaskCreate(TaskServo2, "TaskServo2", 2048, NULL, 1, NULL);
+    xTaskCreate(TaskServo3, "TaskServo3", 2048, NULL, 1, NULL);
+    xTaskCreate(TaskServo4, "TaskServo4", 2048, NULL, 1, NULL);
+    xTaskCreate(TaskServo5, "TaskServo5", 2048, NULL, 1, NULL);
+    xTaskCreate(TaskServo6, "TaskServo6", 2048, NULL, 1, NULL);
 
 #if VERSION == 2
     xTaskCreate(TaskSerial, "TaskSerial", 3072, NULL, 1, NULL);
