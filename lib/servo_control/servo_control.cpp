@@ -53,11 +53,11 @@ static const int POS_INICIAL = 90;
 
 //-----------------------------------------------------
 // Wifi
-const char* ssid = "60824";
-const char* password = "74255668";
+const char* ssid = "I709_2.4G"; // 60824
+const char* password = "37003701"; // 74255668
 
 // MQTT
- const char* mqtt_server = "mqtt-dashboard.com";
+const char* mqtt_server = "mqtt-dashboard.com";
 const int mqtt_port = 1883;
 const char* mqtt_topic = "stust/rob_arm/control";
 //-----------------------------------------------------
@@ -83,7 +83,7 @@ static inline void stepServo(Servo &servo, int idx, int &pos) {
 }
 
 // Interpreta un comando como "base50" o "codo 60"
-static void processCommand(char *cmd) {
+static void processCommand(char *cmd) { 
     // Pasar a minúsculas y quitar espacios
     char clean[100];
     size_t n = 0;
@@ -287,10 +287,9 @@ void mqtt_init() {
 
 // Inicialización (común a ambas versiones)
 void initServos() {
-#if VERSION == 2
+
     for (int i = 0; i < NUM_SERVOS; i++)
         targetPos[i] = POS_INICIAL;
-#endif
 
     // Adjuntar pines
     servo1.attach(pinSM1);
@@ -301,10 +300,15 @@ void initServos() {
     servo6.attach(pinSM6);
 
     xTaskCreate(TaskServo1, "TaskServo1", 2048, NULL, 1, NULL);
+    vTaskDelay(pdMS_TO_TICKS(200)); 
     xTaskCreate(TaskServo2, "TaskServo2", 2048, NULL, 1, NULL);
+    vTaskDelay(pdMS_TO_TICKS(200)); 
     xTaskCreate(TaskServo3, "TaskServo3", 2048, NULL, 1, NULL);
+    vTaskDelay(pdMS_TO_TICKS(200));
     xTaskCreate(TaskServo4, "TaskServo4", 2048, NULL, 1, NULL);
+    vTaskDelay(pdMS_TO_TICKS(200));
     xTaskCreate(TaskServo5, "TaskServo5", 2048, NULL, 1, NULL);
+    vTaskDelay(pdMS_TO_TICKS(200));
     xTaskCreate(TaskServo6, "TaskServo6", 2048, NULL, 1, NULL);
 
 #if VERSION == 2
