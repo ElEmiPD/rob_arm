@@ -260,6 +260,8 @@ void setup() {
     Serial.begin(115200);
 
     initServos(); 
+    wifi_init();
+    mqtt_init();
 }
 
 void loop() {}
