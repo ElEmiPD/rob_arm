@@ -53,13 +53,23 @@ static const int POS_INICIAL = 90;
 
 //-----------------------------------------------------
 // Wifi
-const char* ssid = "I709_2.4G"; // 60824
-const char* password = "37003701"; // 74255668
+const char* ssid = "60824"; // 60824 I709_2.4G
+const char* password = "74255668"; // 74255668 37003701
 
 // MQTT
-const char* mqtt_server = "mqtt-dashboard.com";
+/*
+const char* mqtt_server = "mqtt-dashboard.com"; // 192.168.1.50
 const int mqtt_port = 1883;
-const char* mqtt_topic = "stust/rob_arm/control";
+const char* mqtt_topic = "rob_arm/control"; // "stust/rob_arm/control"
+*/
+
+const char* mqtt_server       = "192.168.0.226";   
+const int   mqtt_port         = 1883;
+const char* mqtt_user         = "arm";
+const char* mqtt_pass         = "arm";
+const char* mqtt_topic        = "rob_arm/control";   // el brazo lee aquí
+const char* mqtt_status_topic = "rob_arm/status";    // el brazo escribe aquí
+
 //-----------------------------------------------------
 
 /*
@@ -83,6 +93,84 @@ static inline void stepServo(Servo &servo, int idx, int &pos) {
 }
 
 // Interpreta un comando como "base50" o "codo 60"
+
+static void processCommand(char *cmd) {
+
+    char *token = strtok(cmd, ",");
+
+    while (token != NULL) {
+
+        char clean[50];
+        size_t n = 0;
+
+        for (char *p = token; *p && n < sizeof(clean) - 1; p++) {
+            if (!isspace((unsigned char)*p))
+                clean[n++] = (char)tolower((unsigned char)*p);
+        }
+
+        clean[n] = '\0';
+
+        if (n == 0) {
+            token = strtok(NULL, ",");
+            continue;
+        }
+
+        char *num = clean;
+
+        while (*num && !isdigit((unsigned char)*num) && *num != '-')
+            num++;
+
+        if (*num == '\0' || num == clean) {
+            Serial.printf("[Command] Formato invalido: %s\n", clean);
+            token = strtok(NULL, ",");
+            continue;
+        }
+
+        char *end;
+        long angle = strtol(num, &end, 10);
+
+        if (*end != '\0') {
+            Serial.printf("[Command] Angulo invalido: %s\n", clean);
+            token = strtok(NULL, ",");
+            continue;
+        }
+
+        *num = '\0';
+
+        bool found = false;
+
+        for (int i = 0; i < NUM_SERVOS; i++) {
+
+            if (strcmp(clean, servoCfg[i].name) == 0) {
+
+                found = true;
+
+                if (angle < servoCfg[i].minAngle ||
+                    angle > servoCfg[i].maxAngle) {
+
+                    Serial.printf("[Command] %s fuera de rango\n",
+                                  servoCfg[i].name);
+
+                } else {
+
+                    targetPos[i] = (int)angle;
+
+                    Serial.printf("[Command] %s -> %ld\n",
+                                  servoCfg[i].name, angle);
+                }
+
+                break;
+            }
+        }
+
+        if (!found)
+            Serial.printf("[Command] Servo desconocido: %s\n", clean);
+
+        token = strtok(NULL, ",");
+    }
+}
+
+/*
 static void processCommand(char *cmd) { 
     // Pasar a minúsculas y quitar espacios
     char clean[100];
@@ -128,7 +216,7 @@ static void processCommand(char *cmd) {
 
     Serial.printf("[Serial] Servo desconocido: %s\n", clean);
 }
-
+*/
 // Tarea que acumula caracteres hasta recibir fin de línea
 void TaskSerial(void *pvParameters) {
     char buf[100];
@@ -231,7 +319,8 @@ void TaskMQTT(void *pvParameters)
                     Serial.print("[MQTT] Conectando con ID: ");
                     Serial.println(clientId);
 
-                    if (client.connect(clientId.c_str())) {
+                    //if (client.connect(clientId.c_str())) {
+                    if (client.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
                         Serial.println("[MQTT] Conectado");
 
                         if (client.subscribe(mqtt_topic)) {
@@ -259,7 +348,7 @@ void TaskMQTT(void *pvParameters)
                         (unsigned long)++counter
                     );
 
-                    if (client.publish(mqtt_topic, mensaje)) {
+                    if (client.publish(mqtt_status_topic, mensaje)) {
                         Serial.printf(
                             "[MQTT] Publicado: %s\n", mensaje
                         );
