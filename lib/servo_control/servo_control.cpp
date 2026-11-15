@@ -20,8 +20,18 @@ TaskHandle_t taskServo4Handle = NULL;
 TaskHandle_t taskServo5Handle = NULL;
 TaskHandle_t taskServo6Handle = NULL;
 
-#if VERSION == 2
-// VERSION 2: control por puerto serial y por MQTT
+
+// Feedback de movimiento
+SemaphoreHandle_t motionDoneSemaphore;
+
+static portMUX_TYPE motionMux = portMUX_INITIALIZER_UNLOCKED;
+
+static volatile uint8_t pendingServos = 0;
+static volatile uint32_t motionGeneration = 0;
+static volatile uint32_t completedGeneration = 0;
+
+//Mutex para evitar condiciones de carrera
+SemaphoreHandle_t commandMutex;
 
 // wifi y mqtt
 String stMac;
@@ -96,7 +106,22 @@ static inline void stepServo(Servo &servo, int idx, int &pos) {
 
 static void processCommand(char *cmd) {
 
-    char *token = strtok(cmd, ",");
+    if (commandMutex != NULL)
+        xSemaphoreTake(commandMutex, portMAX_DELAY);
+
+    int newTargets[NUM_SERVOS];
+
+    portENTER_CRITICAL(&motionMux);
+
+    for (int i = 0; i < NUM_SERVOS; i++)
+        newTargets[i] = targetPos[i];
+
+    portEXIT_CRITICAL(&motionMux);
+
+    bool validCommand = false;
+
+    char *saveptr = NULL;
+    char *token = strtok_r(cmd, ",", &saveptr);
 
     while (token != NULL) {
 
@@ -111,7 +136,7 @@ static void processCommand(char *cmd) {
         clean[n] = '\0';
 
         if (n == 0) {
-            token = strtok(NULL, ",");
+            token = strtok_r(NULL, ",", &saveptr);
             continue;
         }
 
@@ -122,7 +147,7 @@ static void processCommand(char *cmd) {
 
         if (*num == '\0' || num == clean) {
             Serial.printf("[Command] Formato invalido: %s\n", clean);
-            token = strtok(NULL, ",");
+            token = strtok_r(NULL, ",", &saveptr);
             continue;
         }
 
@@ -131,7 +156,7 @@ static void processCommand(char *cmd) {
 
         if (*end != '\0') {
             Serial.printf("[Command] Angulo invalido: %s\n", clean);
-            token = strtok(NULL, ",");
+            token = strtok_r(NULL, ",", &saveptr);
             continue;
         }
 
@@ -148,15 +173,23 @@ static void processCommand(char *cmd) {
                 if (angle < servoCfg[i].minAngle ||
                     angle > servoCfg[i].maxAngle) {
 
-                    Serial.printf("[Command] %s fuera de rango\n",
-                                  servoCfg[i].name);
+                    Serial.printf(
+                        "[Command] %s fuera de rango (%d a %d)\n",
+                        servoCfg[i].name,
+                        servoCfg[i].minAngle,
+                        servoCfg[i].maxAngle
+                    );
 
                 } else {
 
-                    targetPos[i] = (int)angle;
+                    newTargets[i] = (int)angle;
+                    validCommand = true;
 
-                    Serial.printf("[Command] %s -> %ld\n",
-                                  servoCfg[i].name, angle);
+                    Serial.printf(
+                        "[Command] %s -> %ld\n",
+                        servoCfg[i].name,
+                        angle
+                    );
                 }
 
                 break;
@@ -166,57 +199,28 @@ static void processCommand(char *cmd) {
         if (!found)
             Serial.printf("[Command] Servo desconocido: %s\n", clean);
 
-        token = strtok(NULL, ",");
+        token = strtok_r(NULL, ",", &saveptr);
     }
+
+    if (validCommand) {
+
+        portENTER_CRITICAL(&motionMux);
+
+        for (int i = 0; i < NUM_SERVOS; i++)
+            targetPos[i] = newTargets[i];
+
+        pendingServos = NUM_SERVOS;
+        motionGeneration++;
+
+        portEXIT_CRITICAL(&motionMux);
+
+        Serial.println("[ARM] Nuevo movimiento iniciado");
+    }
+
+    if (commandMutex != NULL)
+        xSemaphoreGive(commandMutex);
 }
 
-/*
-static void processCommand(char *cmd) { 
-    // Pasar a minúsculas y quitar espacios
-    char clean[100];
-    size_t n = 0;
-    for (char *p = cmd; *p && n < sizeof(clean) - 1; p++) {
-        if (!isspace((unsigned char)*p))
-            clean[n++] = (char)tolower((unsigned char)*p);
-    }
-    clean[n] = '\0';
-
-    if (n == 0) return;
-
-    // Buscar dónde empieza el número
-    char *num = clean;
-    while (*num && !isdigit((unsigned char)*num) && *num != '-') num++;
-
-    if (*num == '\0' || num == clean) {
-        Serial.println("[Serial] Formato invalido. Ejemplo: base50");
-        return;
-    }
-
-    char *end;
-    long angle = strtol(num, &end, 10);
-    if (*end != '\0') {
-        Serial.println("[Serial] Formato invalido. Ejemplo: base50");
-        return;
-    }
-
-    *num = '\0';  // ahora 'clean' contiene solo el nombre
-
-    for (int i = 0; i < NUM_SERVOS; i++) {
-        if (strcmp(clean, servoCfg[i].name) == 0) {
-            if (angle < servoCfg[i].minAngle || angle > servoCfg[i].maxAngle) {
-                Serial.printf("[Serial] %s fuera de rango (%d a %d)\n",
-                              servoCfg[i].name, servoCfg[i].minAngle, servoCfg[i].maxAngle);
-                return;
-            }
-            targetPos[i] = (int)angle;
-            Serial.printf("[Serial] %s -> %ld\n", servoCfg[i].name, angle);
-            return;
-        }
-    }
-
-    Serial.printf("[Serial] Servo desconocido: %s\n", clean);
-}
-*/
 // Tarea que acumula caracteres hasta recibir fin de línea
 void TaskSerial(void *pvParameters) {
     char buf[100];
@@ -244,6 +248,16 @@ void TaskSerial(void *pvParameters) {
 // ---------------------------------------------------------------
 // wifi
 // ---------------------------------------------------------------
+void wifi_init() {
+    WiFi.mode(WIFI_STA);
+    stMac = WiFi.macAddress();
+
+    Serial.print("[WiFi] MAC: ");
+    Serial.println(stMac);
+
+    xTaskCreatePinnedToCore(TaskWIFI, "WiFi", 3072, NULL, 2, NULL, 0);
+}
+
 void TaskWIFI(void *pvParameters)
 {
     while (1) {
@@ -263,19 +277,18 @@ void TaskWIFI(void *pvParameters)
     }
 }
 
-void wifi_init() {
-    WiFi.mode(WIFI_STA);
-    stMac = WiFi.macAddress();
-
-    Serial.print("[WiFi] MAC: ");
-    Serial.println(stMac);
-
-    xTaskCreatePinnedToCore(TaskWIFI, "WiFi", 3072, NULL, 2, NULL, 0);
-}
-
 // ---------------------------------------------------------------
 // mqtt
 // ---------------------------------------------------------------
+
+void mqtt_init() {
+    client.setServer(mqtt_server, mqtt_port);
+    client.setCallback(mqttCallback);
+    client.setKeepAlive(15);
+    client.setSocketTimeout(3);
+
+    xTaskCreatePinnedToCore(TaskMQTT, "MQTT", 4096, NULL, 1, NULL, 1);
+}
 
 // Cada mensaje recibido se interpreta como un comando (ej. "base50")
 void mqttCallback(char* topic, byte* payload, unsigned int length)
@@ -363,16 +376,9 @@ void TaskMQTT(void *pvParameters)
     }
 }
 
-void mqtt_init() {
-    client.setServer(mqtt_server, mqtt_port);
-    client.setCallback(mqttCallback);
-    client.setKeepAlive(15);
-    client.setSocketTimeout(3);
-
-    xTaskCreatePinnedToCore(TaskMQTT, "MQTT", 4096, NULL, 1, NULL, 1);
-}
-
-#endif // VERSION == 2
+// ---------------------------------------------------------------
+// Servos
+// ---------------------------------------------------------------
 
 // Inicialización (común a ambas versiones)
 void initServos() {
@@ -400,14 +406,61 @@ void initServos() {
     vTaskDelay(pdMS_TO_TICKS(200));
     xTaskCreate(TaskServo6, "TaskServo6", 2048, NULL, 1, NULL);
 
-#if VERSION == 2
     xTaskCreate(TaskSerial, "TaskSerial", 3072, NULL, 1, NULL);
 
     Serial.println("[Servos] Comandos: <nombre><angulo>, ej. base50, codo60");
     for (int i = 0; i < NUM_SERVOS; i++) {
         Serial.printf("  %s (%d a %d)\n", servoCfg[i].name, servoCfg[i].minAngle, servoCfg[i].maxAngle);
     }
-#endif
+
+    //Inicializar semaforo 
+    motionDoneSemaphore = xSemaphoreCreateBinary();
+    commandMutex = xSemaphoreCreateMutex();
+
+    if (motionDoneSemaphore == NULL || commandMutex == NULL) {
+        Serial.println("[ARM] Error creando mecanismos de sincronizacion");
+        return;
+    }
+
+    xTaskCreate(TaskMotionMonitor, "MotionMonitor", 2048, NULL, 2, NULL);
+
+}
+
+void checkServoCompletion(
+    int idx,
+    int currentPos,
+    uint32_t &lastGeneration,
+    bool &reported
+) {
+    bool allCompleted = false;
+
+    portENTER_CRITICAL(&motionMux);
+
+    uint32_t generation = motionGeneration;
+
+    if (generation != lastGeneration) {
+        lastGeneration = generation;
+        reported = false;
+    }
+
+    if (!reported &&
+        currentPos == targetPos[idx] &&
+        pendingServos > 0) {
+
+        pendingServos--;
+        reported = true;
+
+        if (pendingServos == 0) {
+            completedGeneration = generation;
+            allCompleted = true;
+        }
+    }
+
+    portEXIT_CRITICAL(&motionMux);
+
+    if (allCompleted) {
+        xSemaphoreGive(motionDoneSemaphore);
+    }
 }
 
 // Tareas de los servos
@@ -419,11 +472,15 @@ void TaskServo1(void *pvParameters) {
     const TickType_t xFrequency = pdMS_TO_TICKS(15);
     int posServo1 = POS_INICIAL;
 
+    uint32_t lastGeneration = 0;
+    bool reported = false;
+
     // Base
     servo1.write(posServo1);
 
     while (1) {
         stepServo(servo1, 0, posServo1);
+        checkServoCompletion(0, posServo1, lastGeneration, reported);
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
     }
 }
@@ -433,10 +490,14 @@ void TaskServo2(void *pvParameters) {
     const TickType_t xFrequency = pdMS_TO_TICKS(15);
     int posServo2 = POS_INICIAL;
 
+    uint32_t lastGeneration = 0;
+    bool reported = false;
+
     servo2.write(posServo2);
 
     while (1) {
         stepServo(servo2, 1, posServo2);
+        checkServoCompletion(1, posServo2, lastGeneration, reported);
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
     }
 }
@@ -446,10 +507,14 @@ void TaskServo3(void *pvParameters) {
     const TickType_t xFrequency = pdMS_TO_TICKS(15);
     int posServo3 = POS_INICIAL;
 
+    uint32_t lastGeneration = 0;
+    bool reported = false;
+
     servo3.write(posServo3);
 
     while (1) {
         stepServo(servo3, 2, posServo3);
+        checkServoCompletion(2, posServo3, lastGeneration, reported);
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
     }
 }
@@ -459,10 +524,14 @@ void TaskServo4(void *pvParameters) {
     const TickType_t xFrequency = pdMS_TO_TICKS(15);
     int posServo4 = POS_INICIAL;
 
+    uint32_t lastGeneration = 0;
+    bool reported = false;
+
     servo4.write(posServo4);
 
     while (1) {
         stepServo(servo4, 3, posServo4);
+        checkServoCompletion(3, posServo4, lastGeneration, reported);
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
     }
 }
@@ -472,10 +541,14 @@ void TaskServo5(void *pvParameters) {
     const TickType_t xFrequency = pdMS_TO_TICKS(15);
     int posServo5 = POS_INICIAL;
 
+    uint32_t lastGeneration = 0;
+    bool reported = false;
+
     servo5.write(posServo5);
 
     while (1) {
         stepServo(servo5, 4, posServo5);
+        checkServoCompletion(4, posServo5, lastGeneration, reported);
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
     }
 }
@@ -485,11 +558,48 @@ void TaskServo6(void *pvParameters) {
     const TickType_t xFrequency = pdMS_TO_TICKS(15);
     int posServo6 = POS_INICIAL;
 
+    uint32_t lastGeneration = 0;
+    bool reported = false;
+
     servo6.write(posServo6);
 
     while (1) {
         stepServo(servo6, 5, posServo6);
+        checkServoCompletion(5, posServo6, lastGeneration, reported);
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    }
+}
+
+void TaskMotionMonitor(void *pvParameters) {
+
+    uint32_t lastReportedGeneration = 0;
+
+    while (1) {
+
+        if (xSemaphoreTake(motionDoneSemaphore, portMAX_DELAY) == pdTRUE) {
+
+            bool completed = false;
+            uint32_t generation = 0;
+
+            portENTER_CRITICAL(&motionMux);
+
+            if (pendingServos == 0 &&
+                completedGeneration != lastReportedGeneration) {
+
+                generation = completedGeneration;
+                lastReportedGeneration = generation;
+                completed = true;
+            }
+
+            portEXIT_CRITICAL(&motionMux);
+
+            if (completed) {
+                Serial.printf(
+                    "[ARM] MOVEMENT_DONE - Generation: %lu\n",
+                    (unsigned long)generation
+                );
+            }
+        }
     }
 }
 
