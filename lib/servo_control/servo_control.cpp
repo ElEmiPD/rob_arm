@@ -245,6 +245,39 @@ void TaskSerial(void *pvParameters) {
     }
 }
 
+void TaskMotionMonitor(void *pvParameters) {
+
+    uint32_t lastReportedGeneration = 0;
+
+    while (1) {
+
+        if (xSemaphoreTake(motionDoneSemaphore, portMAX_DELAY) == pdTRUE) {
+
+            bool completed = false;
+            uint32_t generation = 0;
+
+            portENTER_CRITICAL(&motionMux);
+
+            if (pendingServos == 0 &&
+                completedGeneration != lastReportedGeneration) {
+
+                generation = completedGeneration;
+                lastReportedGeneration = generation;
+                completed = true;
+            }
+
+            portEXIT_CRITICAL(&motionMux);
+
+            if (completed) {
+                Serial.printf(
+                    "[ARM] MOVEMENT_DONE - Generation: %lu\n",
+                    (unsigned long)generation
+                );
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------
 // wifi
 // ---------------------------------------------------------------
@@ -426,12 +459,8 @@ void initServos() {
 
 }
 
-void checkServoCompletion(
-    int idx,
-    int currentPos,
-    uint32_t &lastGeneration,
-    bool &reported
-) {
+void checkServoCompletion(int idx, int currentPos, uint32_t &lastGeneration, bool &reported) 
+{
     bool allCompleted = false;
 
     portENTER_CRITICAL(&motionMux);
@@ -570,38 +599,7 @@ void TaskServo6(void *pvParameters) {
     }
 }
 
-void TaskMotionMonitor(void *pvParameters) {
 
-    uint32_t lastReportedGeneration = 0;
-
-    while (1) {
-
-        if (xSemaphoreTake(motionDoneSemaphore, portMAX_DELAY) == pdTRUE) {
-
-            bool completed = false;
-            uint32_t generation = 0;
-
-            portENTER_CRITICAL(&motionMux);
-
-            if (pendingServos == 0 &&
-                completedGeneration != lastReportedGeneration) {
-
-                generation = completedGeneration;
-                lastReportedGeneration = generation;
-                completed = true;
-            }
-
-            portEXIT_CRITICAL(&motionMux);
-
-            if (completed) {
-                Serial.printf(
-                    "[ARM] MOVEMENT_DONE - Generation: %lu\n",
-                    (unsigned long)generation
-                );
-            }
-        }
-    }
-}
 
 #else
 // ---- VERSIONES ANTERIORES: barrido automático ----
