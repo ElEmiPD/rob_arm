@@ -13,12 +13,14 @@ Servo servo5;
 Servo servo6;
 
 // Handles de las tareas
+/*
 TaskHandle_t taskServo1Handle = NULL;
 TaskHandle_t taskServo2Handle = NULL;
 TaskHandle_t taskServo3Handle = NULL;
 TaskHandle_t taskServo4Handle = NULL;
 TaskHandle_t taskServo5Handle = NULL;
 TaskHandle_t taskServo6Handle = NULL;
+*/
 
 
 // Feedback de movimiento
@@ -66,8 +68,8 @@ static const TickType_t SETTLE_TICKS = pdMS_TO_TICKS(300);
 
 //-----------------------------------------------------
 // Wifi
-const char* ssid = "60824"; // 60824 I709_2.4G
-const char* password = "74255668"; // 74255668 37003701
+const char* ssid = MY_WIFI_SSID;
+const char* password = MY_WIFI_PSWD;
 
 // MQTT
 /*
@@ -78,8 +80,8 @@ const char* mqtt_topic = "rob_arm/control"; // "stust/rob_arm/control"
 
 const char* mqtt_server       = "192.168.0.226";   
 const int   mqtt_port         = 1883;
-const char* mqtt_user         = "arm";
-const char* mqtt_pass         = "arm";
+const char* mqtt_user         = MQTT_USER;
+const char* mqtt_pass         = MQTT_PSWD;
 const char* mqtt_topic        = "rob_arm/control";   // el brazo lee aquí
 const char* mqtt_status_topic = "rob_arm/status";    // el brazo escribe aquí
 const char* mqtt_conn_topic   = "rob_arm/conexion";  // online/offline

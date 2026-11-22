@@ -7,6 +7,7 @@
 
 #include <Arduino.h>
 #include <ESP32Servo.h>
+#include "../pswd/pswd.h"
 
 // Comandos por wifi
 #include <WiFi.h>
@@ -45,7 +46,7 @@ void wifi_init();
 
 void mqtt_init();
 
-void mqtt_callback(char* topic, byte* payload, unsigned int length);
+//void mqtt_callback(char* topic, byte* payload, unsigned int length);
 
 void TaskWIFI(void *pvParameters);
 void TaskMQTT(void *pvParameters);
