@@ -25,8 +25,15 @@ TaskHandle_t taskServo6Handle = NULL;
 
 // Feedback de movimiento
 SemaphoreHandle_t motionDoneSemaphore;
-QueueHandle_t     motionDoneQueue;      // NUEVO: generación terminada → TaskMQTT
 
+// Evento de fin de movimiento: TaskMotionMonitor -> TaskMQTT
+typedef struct {
+    uint32_t generation;
+    int      pos[NUM_SERVOS];   // posición final de cada servo (grados)
+} MotionDone_t;
+
+// Cola de longitud 1 (xQueueOverwrite): solo importa el movimiento más reciente
+QueueHandle_t     motionDoneQueue;
 
 static portMUX_TYPE motionMux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -73,18 +80,22 @@ const char* password = MY_WIFI_PSWD;
 
 // MQTT
 /*
-const char* mqtt_server = "mqtt-dashboard.com"; // 192.168.1.50
+const char* mqtt_server = "mqtt-dashboard.com"; // 192.168.1.50 //"192.168.0.226"
 const int mqtt_port = 1883;
-const char* mqtt_topic = "rob_arm/control"; // "stust/rob_arm/control"
+const char* mqtt_topic = "rob_arm/control"; // "stust/rob_arm/control" 
 */
 
-const char* mqtt_server       = "192.168.0.226";   
+const char* mqtt_server       = "mqtt-dashboard.com";   
 const int   mqtt_port         = 1883;
 const char* mqtt_user         = MQTT_USER;
 const char* mqtt_pass         = MQTT_PSWD;
-const char* mqtt_topic        = "rob_arm/control";   // el brazo lee aquí
-const char* mqtt_status_topic = "rob_arm/status";    // el brazo escribe aquí
-const char* mqtt_conn_topic   = "rob_arm/conexion";  // online/offline
+
+// MQTT topics
+const char* mqtt_topic              = "rob_arm/control";   // el brazo lee aquí
+const char* mqtt_status_topic       = "rob_arm/status";    // el brazo escribe aquí
+const char* mqtt_conn_topic         = "rob_arm/conexion";  // online/offline
+const char* mqtt_config_topic       = "rob_arm/config";         // el brazo lee: velocidad
+const char* mqtt_config_state_topic = "rob_arm/config/estado";  // configuración vigente (retenido)
 //-----------------------------------------------------
 
 /*
@@ -94,6 +105,24 @@ const char* mqtt_conn_topic   = "rob_arm/conexion";  // online/offline
 */
 static volatile int targetPos[NUM_SERVOS];
 static volatile int currentPos[NUM_SERVOS];
+
+/*
+  Velocidad: milisegundos que tarda cada servo en avanzar 1 grado
+  (periodo de su tarea). La escribe processConfig y la lee cada tarea
+  de servo en cada ciclo: el cambio aplica en el siguiente paso,
+  incluso a mitad de un movimiento.
+    15 ms/grado -> ~66 °/s (valor original)
+*/
+static const uint32_t DEFAULT_PERIOD_MS = 15;
+static const uint32_t MIN_PERIOD_MS     = 5;     // ~200 °/s
+static const uint32_t MAX_PERIOD_MS     = 200;   // 5 °/s
+
+static volatile uint32_t stepPeriodMs[NUM_SERVOS];
+
+// TaskMQTT debe (re)publicar rob_arm/config/estado
+static volatile bool configDirty = false;
+
+static Preferences prefs;
 
 // Avanza 1 grado hacia el objetivo (solo escribe si hay cambio)
 static inline bool stepServo(Servo &servo, int idx, int &pos) {
@@ -238,6 +267,185 @@ static void processCommand(char *cmd) {
         xSemaphoreGive(commandMutex);
 }
 
+
+
+// ---------------------------------------------------------------
+// Configuración de velocidad
+// ---------------------------------------------------------------
+
+typedef enum {
+    TOK_EMPTY,   // token vacío (ej. ",,")
+    TOK_WORD,    // solo letras: "estado"
+    TOK_PAIR,    // nombre + número: "base20", "codo 30"
+    TOK_ERROR    // formato inválido (el mensaje ya se imprimió)
+} TokenType_t;
+
+/*
+  Limpia el token (quita espacios, pasa a minúsculas) en 'clean'.
+  Si es TOK_PAIR, deja solo el nombre en 'clean' y el número en 'value'.
+*/
+static TokenType_t parseToken(const char *token, char *clean, size_t size,
+                              long &value, const char *tag) {
+    size_t n = 0;
+
+    for (const char *p = token; *p && n < size - 1; p++) {
+        if (!isspace((unsigned char)*p))
+            clean[n++] = (char)tolower((unsigned char)*p);
+    }
+    clean[n] = '\0';
+
+    if (n == 0)
+        return TOK_EMPTY;
+
+    char *num = clean;
+    while (*num && !isdigit((unsigned char)*num) && *num != '-')
+        num++;
+
+    if (*num == '\0')
+        return TOK_WORD;
+
+    if (num == clean) {
+        Serial.printf("%s Formato invalido: %s\n", tag, clean);
+        return TOK_ERROR;
+    }
+
+    char *end;
+    value = strtol(num, &end, 10);
+
+    if (*end != '\0') {
+        Serial.printf("%s Valor invalido: %s\n", tag, clean);
+        return TOK_ERROR;
+    }
+
+    *num = '\0';
+    return TOK_PAIR;
+}
+
+// Índice del servo con ese nombre, o -1
+static int findServo(const char *name) {
+    for (int i = 0; i < NUM_SERVOS; i++)
+        if (strcmp(name, servoCfg[i].name) == 0)
+            return i;
+    return -1;
+}
+
+// Clave NVS por servo, ej. "per_hombro" (máx. 15 caracteres)
+static void periodKey(char *key, size_t size, int idx) {
+    snprintf(key, size, "per_%s", servoCfg[idx].name);
+}
+
+// Carga los periodos guardados (o el valor por defecto en el primer arranque)
+static void loadPeriods() {
+    for (int i = 0; i < NUM_SERVOS; i++)
+        stepPeriodMs[i] = DEFAULT_PERIOD_MS;
+
+    if (!prefs.begin("rob_arm", true))      // solo lectura; falla si aún no existe
+        return;
+
+    for (int i = 0; i < NUM_SERVOS; i++) {
+        char key[16];
+        periodKey(key, sizeof(key), i);
+
+        uint32_t v = prefs.getUInt(key, DEFAULT_PERIOD_MS);
+        if (v >= MIN_PERIOD_MS && v <= MAX_PERIOD_MS)
+            stepPeriodMs[i] = v;
+    }
+
+    prefs.end();
+}
+
+static void savePeriods() {
+    if (!prefs.begin("rob_arm", false)) {
+        Serial.println("[Config] No se pudo abrir NVS");
+        return;
+    }
+
+    for (int i = 0; i < NUM_SERVOS; i++) {
+        char key[16];
+        periodKey(key, sizeof(key), i);
+        prefs.putUInt(key, stepPeriodMs[i]);
+    }
+
+    prefs.end();
+}
+
+/*
+  Mensajes en rob_arm/config (o por Serial con el prefijo "cfg "):
+    base20,codo30   -> ms por grado de esos servos
+    todos15         -> mismo periodo para los seis
+    estado          -> solo republica la configuración vigente
+  Rango válido: MIN_PERIOD_MS a MAX_PERIOD_MS. El cambio aplica de inmediato,
+  incluso a mitad de un movimiento, y se guarda en NVS.
+*/
+static void processConfig(char *cmd) {
+
+    xSemaphoreTake(commandMutex, portMAX_DELAY);
+
+    uint32_t newPeriods[NUM_SERVOS];
+    for (int i = 0; i < NUM_SERVOS; i++)
+        newPeriods[i] = stepPeriodMs[i];
+
+    bool changed = false;
+
+    char *saveptr = NULL;
+    char *token = strtok_r(cmd, ",", &saveptr);
+
+    for (; token != NULL; token = strtok_r(NULL, ",", &saveptr)) {
+
+        char clean[50];
+        long ms = 0;
+        TokenType_t type = parseToken(token, clean, sizeof(clean), ms, "[Config]");
+
+        if (type == TOK_EMPTY || type == TOK_ERROR)
+            continue;
+
+        if (type == TOK_WORD) {
+            if (strcmp(clean, "estado") != 0)
+                Serial.printf("[Config] Formato invalido: %s\n", clean);
+            continue;                       // "estado": solo republicar
+        }
+
+        if (ms < (long)MIN_PERIOD_MS || ms > (long)MAX_PERIOD_MS) {
+            Serial.printf("[Config] %s: periodo fuera de rango (%lu a %lu ms)\n",
+                          clean, (unsigned long)MIN_PERIOD_MS, (unsigned long)MAX_PERIOD_MS);
+            continue;
+        }
+
+        if (strcmp(clean, "todos") == 0) {
+            for (int i = 0; i < NUM_SERVOS; i++)
+                newPeriods[i] = (uint32_t)ms;
+            changed = true;
+            Serial.printf("[Config] todos -> %ld ms/grado\n", ms);
+            continue;
+        }
+
+        int i = findServo(clean);
+
+        if (i < 0) {
+            Serial.printf("[Config] Servo desconocido: %s\n", clean);
+            continue;
+        }
+
+        newPeriods[i] = (uint32_t)ms;
+        changed = true;
+        Serial.printf("[Config] %s -> %ld ms/grado\n", servoCfg[i].name, ms);
+    }
+
+    if (changed) {
+        for (int i = 0; i < NUM_SERVOS; i++)
+            stepPeriodMs[i] = newPeriods[i];   // 32 bits: escritura atómica
+
+        savePeriods();
+    }
+
+    configDirty = true;     // TaskMQTT publica el resultado (cambió o no)
+
+    xSemaphoreGive(commandMutex);
+}
+
+
+// ---------------------------------------------------------------
+
 // Tarea que acumula caracteres hasta recibir fin de línea
 void TaskSerial(void *pvParameters) {
     char buf[100];
@@ -255,7 +463,13 @@ void TaskSerial(void *pvParameters) {
                     len = 0;
                 } else if (len > 0) {
                     buf[len] = '\0';
-                    processCommand(buf);
+
+                    // "cfg base20,codo30" -> configuración; lo demás -> movimiento
+                    if (strncasecmp(buf, "cfg ", 4) == 0)
+                        processConfig(buf + 4);
+                    else
+                        processCommand(buf);
+
                     len = 0;
                 }
             } else if (len < sizeof(buf) - 1) {
@@ -278,15 +492,18 @@ void TaskMotionMonitor(void *pvParameters) {
         if (xSemaphoreTake(motionDoneSemaphore, portMAX_DELAY) == pdTRUE) {
 
             bool completed = false;
-            uint32_t generation = 0;
+            MotionDone_t ev;
 
             portENTER_CRITICAL(&motionMux);
 
             if (pendingServos == 0 &&
                 completedGeneration != lastReportedGeneration) {
 
-                generation = completedGeneration;
-                lastReportedGeneration = generation;
+                ev.generation = completedGeneration;
+                for (int i = 0; i < NUM_SERVOS; i++)
+                    ev.pos[i] = currentPos[i];        // foto de la posición final
+
+                lastReportedGeneration = ev.generation;
                 completed = true;
             }
 
@@ -295,10 +512,10 @@ void TaskMotionMonitor(void *pvParameters) {
             if (completed) {
                 Serial.printf(
                     "[ARM] MOVEMENT_DONE - Generation: %lu\n",
-                    (unsigned long)generation
+                    (unsigned long)ev.generation
                 );
-                // Sobrescribe: si hay una generación previa sin publicar, gana la más reciente
-                xQueueOverwrite(motionDoneQueue, &generation);
+                // Sobrescribe: si hay uno previo sin publicar, gana el más reciente
+                xQueueOverwrite(motionDoneQueue, &ev);
             }
         }
     }
@@ -351,6 +568,71 @@ void TaskWIFI(void *pvParameters)
 // mqtt
 // ---------------------------------------------------------------
 
+/*
+  Cadena para rob_arm/status:
+    MOVEMENT_DONE gen=5 pos=base50,hombro90,codo60,muneca90,giro90,pinza90
+  Devuelve false si no cupo en el buffer.
+*/
+static bool buildStatusMsg(char *out, size_t size, const MotionDone_t &ev) {
+    int n = snprintf(out, size, "MOVEMENT_DONE gen=%lu pos=",
+                     (unsigned long)ev.generation);
+
+    for (int i = 0; i < NUM_SERVOS; i++) {
+        if (n < 0 || (size_t)n >= size)
+            return false;
+
+        n += snprintf(out + n, size - n, "%s%s%d",
+                      i ? "," : "", servoCfg[i].name, ev.pos[i]);
+    }
+
+    return n > 0 && (size_t)n < size;
+}
+
+/*
+  rob_arm/config/estado (retenido): configuración de velocidad vigente.
+  {"periodo_ms":{"base":15,...},"vel_grados_s":{"base":66.7,...},"rango_ms":[5,200]}
+*/
+static void publishConfig() {
+    char per[128], vel[160], msg[352];
+    int n;
+
+    n = snprintf(per, sizeof(per), "{");
+    for (int i = 0; i < NUM_SERVOS && n > 0 && (size_t)n < sizeof(per); i++)
+        n += snprintf(per + n, sizeof(per) - n, "%s\"%s\":%lu",
+                      i ? "," : "", servoCfg[i].name, (unsigned long)stepPeriodMs[i]);
+    if (n > 0 && (size_t)n < sizeof(per))
+        n += snprintf(per + n, sizeof(per) - n, "}");
+    if (n <= 0 || (size_t)n >= sizeof(per)) {
+        Serial.println("[MQTT] Config demasiado larga");
+        return;
+    }
+
+    n = snprintf(vel, sizeof(vel), "{");
+    for (int i = 0; i < NUM_SERVOS && n > 0 && (size_t)n < sizeof(vel); i++)
+        n += snprintf(vel + n, sizeof(vel) - n, "%s\"%s\":%.1f",
+                      i ? "," : "", servoCfg[i].name, 1000.0 / stepPeriodMs[i]);
+    if (n > 0 && (size_t)n < sizeof(vel))
+        n += snprintf(vel + n, sizeof(vel) - n, "}");
+    if (n <= 0 || (size_t)n >= sizeof(vel)) {
+        Serial.println("[MQTT] Config demasiado larga");
+        return;
+    }
+
+    n = snprintf(msg, sizeof(msg),
+                 "{\"periodo_ms\":%s,\"vel_grados_s\":%s,\"rango_ms\":[%lu,%lu]}",
+                 per, vel, (unsigned long)MIN_PERIOD_MS, (unsigned long)MAX_PERIOD_MS);
+    if (n <= 0 || (size_t)n >= sizeof(msg)) {
+        Serial.println("[MQTT] Config demasiado larga");
+        return;
+    }
+
+    if (client.publish(mqtt_config_state_topic, msg, true))
+        Serial.printf("[MQTT] Config: %s\n", msg);
+    else
+        Serial.println("[MQTT] Error al publicar config");
+}
+
+
 void mqtt_init() {
     client.setServer(mqtt_server, mqtt_port);
     client.setCallback(mqttCallback);
@@ -380,7 +662,10 @@ void mqttCallback(char* topic, byte* payload, unsigned int length)
 
     Serial.println();
 
-    processCommand(buf);
+    if (strcmp(topic, mqtt_config_topic) == 0)
+        processConfig(buf);
+    else
+        processCommand(buf);
 }
 
 void TaskMQTT(void *pvParameters)
@@ -412,6 +697,13 @@ void TaskMQTT(void *pvParameters)
                             Serial.print("[MQTT] Suscrito a: ");
                             Serial.println(mqtt_topic);
                         }
+
+                        if (client.subscribe(mqtt_config_topic)) {
+                            Serial.print("[MQTT] Suscrito a: ");
+                            Serial.println(mqtt_config_topic);
+                        }
+
+                        configDirty = true;   // publicar la configuración vigente
                     } else {
                         Serial.printf(
                             "[MQTT] Error de conexion: %d\n",
@@ -422,37 +714,23 @@ void TaskMQTT(void *pvParameters)
             } else {
                 client.loop();
 
-                uint32_t doneGen;
-                if (xQueueReceive(motionDoneQueue, &doneGen, 0) == pdTRUE) {
-                    char msg[48];
-                    snprintf(msg, sizeof(msg), "MOVEMENT_DONE gen=%lu", (unsigned long)doneGen);
+                MotionDone_t ev;
+                if (xQueueReceive(motionDoneQueue, &ev, 0) == pdTRUE) {
+                    char msg[128];
 
-                    if (client.publish(mqtt_status_topic, msg))
+                    if (!buildStatusMsg(msg, sizeof(msg), ev))
+                        Serial.println("[MQTT] Status demasiado largo");
+                    else if (client.publish(mqtt_status_topic, msg, true))   // retenido
                         Serial.printf("[MQTT] Publicado: %s\n", msg);
                     else
                         Serial.println("[MQTT] Error al publicar MOVEMENT_DONE");
                 }
-                /*
-                if (millis() - lastPublish >= 60000) {
-                    lastPublish = millis();
 
-                    char mensaje[100];
-
-                    snprintf(
-                        mensaje, sizeof(mensaje),
-                        "Hola desde ESP32. Mensaje: %lu",
-                        (unsigned long)++counter
-                    );
-
-                    if (client.publish(mqtt_status_topic, mensaje)) {
-                        Serial.printf(
-                            "[MQTT] Publicado: %s\n", mensaje
-                        );
-                    } else {
-                        Serial.println("[MQTT] Error al publicar");
-                    }
+                // Rama config/estado: tras un cambio de velocidad o al conectar
+                if (configDirty) {
+                    configDirty = false;
+                    publishConfig();
                 }
-                */
             }
         }
 
@@ -469,7 +747,7 @@ void initServos() {
     // 1) Sincronización
     motionDoneSemaphore = xSemaphoreCreateBinary();
     commandMutex        = xSemaphoreCreateMutex();
-    motionDoneQueue     = xQueueCreate(1, sizeof(uint32_t));   // ver cambio 4
+        motionDoneQueue     = xQueueCreate(1, sizeof(MotionDone_t));   // ver cambio 4
 
     if (motionDoneSemaphore == NULL || commandMutex == NULL || motionDoneQueue == NULL) {
         Serial.println("[ARM] Error creando mecanismos de sincronizacion");
@@ -481,6 +759,8 @@ void initServos() {
         targetPos[i]  = POS_INICIAL;
         currentPos[i] = POS_INICIAL;                 // ver cambio 5
     }
+
+    loadPeriods();          // velocidad guardada en NVS (15 ms/grado si no hay)
 
     // 3) Pines
     servo1.attach(pinSM1);
@@ -510,12 +790,14 @@ void initServos() {
     xTaskCreate(TaskSerial, "TaskSerial", 3072, NULL, 1, NULL);
 
     Serial.println("[Servos] Comandos: <nombre><angulo>, ej. base50, codo60");
+    Serial.println("[Servos] Velocidad: cfg <nombre><ms>, ej. cfg base20 | cfg todos15 | cfg estado");
+
     for (int i = 0; i < NUM_SERVOS; i++) {
         Serial.printf("  %s (%d a %d)\n", servoCfg[i].name, servoCfg[i].minAngle, servoCfg[i].maxAngle);
     }
 }
 
-void checkServoCompletion(int idx, int currentPos, TickType_t lastMoveTick,
+void checkServoCompletion(int idx, int pos, TickType_t lastMoveTick,
                           uint32_t &lastGeneration, bool &reported)
 {
     bool allCompleted = false;
@@ -534,7 +816,7 @@ void checkServoCompletion(int idx, int currentPos, TickType_t lastMoveTick,
 
     if (!reported &&
         settled &&
-        currentPos == targetPos[idx] &&
+        pos == targetPos[idx] &&
         pendingServos > 0) {
 
         pendingServos--;
@@ -559,7 +841,7 @@ void checkServoCompletion(int idx, int currentPos, TickType_t lastMoveTick,
 
 void TaskServo1(void *pvParameters) {
     TickType_t xLastWakeTime = xTaskGetTickCount();
-    const TickType_t xFrequency = pdMS_TO_TICKS(15);
+    //const TickType_t xFrequency = pdMS_TO_TICKS(15);
     int posServo1 = POS_INICIAL;
 
     uint32_t lastGeneration = 0;
@@ -575,13 +857,14 @@ void TaskServo1(void *pvParameters) {
         lastMoveTick = xTaskGetTickCount();
 
         checkServoCompletion(0, posServo1, lastMoveTick, lastGeneration, reported);
-        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(stepPeriodMs[0]));
+        //vTaskDelayUntil(&xLastWakeTime, xFrequency);
     }
 }
 
 void TaskServo2(void *pvParameters) {
     TickType_t xLastWakeTime = xTaskGetTickCount();
-    const TickType_t xFrequency = pdMS_TO_TICKS(15);
+    //const TickType_t xFrequency = pdMS_TO_TICKS(15);
     int posServo2 = POS_INICIAL;
 
     uint32_t lastGeneration = 0;
@@ -595,13 +878,14 @@ void TaskServo2(void *pvParameters) {
         if (stepServo(servo2, 1, posServo2))
             lastMoveTick = xTaskGetTickCount();
         checkServoCompletion(1, posServo2, lastMoveTick, lastGeneration, reported);
-        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(stepPeriodMs[1]));
+        //vTaskDelayUntil(&xLastWakeTime, xFrequency);
     }
 }
 
 void TaskServo3(void *pvParameters) {
     TickType_t xLastWakeTime = xTaskGetTickCount();
-    const TickType_t xFrequency = pdMS_TO_TICKS(15);
+    //const TickType_t xFrequency = pdMS_TO_TICKS(15);
     int posServo3 = POS_INICIAL;
 
     uint32_t lastGeneration = 0;
@@ -613,13 +897,14 @@ void TaskServo3(void *pvParameters) {
         if (stepServo(servo3, 2, posServo3))
             lastMoveTick = xTaskGetTickCount();
         checkServoCompletion(2, posServo3, lastMoveTick, lastGeneration, reported);
-        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(stepPeriodMs[2]));
+        //vTaskDelayUntil(&xLastWakeTime, xFrequency);
     }
 }
 
 void TaskServo4(void *pvParameters) {
     TickType_t xLastWakeTime = xTaskGetTickCount();
-    const TickType_t xFrequency = pdMS_TO_TICKS(15);
+    //const TickType_t xFrequency = pdMS_TO_TICKS(15);
     int posServo4 = POS_INICIAL;
 
     uint32_t lastGeneration = 0;
@@ -632,13 +917,14 @@ void TaskServo4(void *pvParameters) {
         if (stepServo(servo4, 3, posServo4))
             lastMoveTick = xTaskGetTickCount();
         checkServoCompletion(3, posServo4, lastMoveTick, lastGeneration, reported);
-        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(stepPeriodMs[3]));
+        //vTaskDelayUntil(&xLastWakeTime, xFrequency);
     }
 }
 
 void TaskServo5(void *pvParameters) {
     TickType_t xLastWakeTime = xTaskGetTickCount();
-    const TickType_t xFrequency = pdMS_TO_TICKS(15);
+    //const TickType_t xFrequency = pdMS_TO_TICKS(15);
     int posServo5 = POS_INICIAL;
 
     uint32_t lastGeneration = 0;
@@ -651,13 +937,14 @@ void TaskServo5(void *pvParameters) {
         if (stepServo(servo5, 4, posServo5))
             lastMoveTick = xTaskGetTickCount();
         checkServoCompletion(4, posServo5, lastMoveTick, lastGeneration, reported);
-        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(stepPeriodMs[4]));
+        //vTaskDelayUntil(&xLastWakeTime, xFrequency);
     }
 }
 
 void TaskServo6(void *pvParameters) {
     TickType_t xLastWakeTime = xTaskGetTickCount();
-    const TickType_t xFrequency = pdMS_TO_TICKS(15);
+    //const TickType_t xFrequency = pdMS_TO_TICKS(15);
     int posServo6 = POS_INICIAL;
 
     uint32_t lastGeneration = 0;
@@ -669,7 +956,8 @@ void TaskServo6(void *pvParameters) {
         if (stepServo(servo6, 5, posServo6))
             lastMoveTick = xTaskGetTickCount();
         checkServoCompletion(5, posServo6, lastMoveTick, lastGeneration, reported);
-        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(stepPeriodMs[5]));
+        //vTaskDelayUntil(&xLastWakeTime, xFrequency);
     }
 }
 

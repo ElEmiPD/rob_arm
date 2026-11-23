@@ -9,6 +9,9 @@
 #include <ESP32Servo.h>
 #include "../pswd/pswd.h"
 
+#include <Preferences.h>
+#include <strings.h>
+
 // Comandos por wifi
 #include <WiFi.h>
 #include <PubSubClient.h>
